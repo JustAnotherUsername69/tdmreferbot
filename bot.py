@@ -12,13 +12,15 @@ ADMIN_ID = 577188267
 CHANNEL_ID = -1001267968308
 CHANNEL_INVITE = "https://t.me/+s3SQO0QOY_wwZDQ1"
 
+COUPON_LOG_CHANNEL = -1003516164058
+BROADCAST_LOG_CHANNEL = -1003536597909
+USER_LOG_CHANNEL = -1003477822786
+
 REDEEM_INSTRUCTIONS = (
     "📌 Coupon Usage Instructions\n"
     "• Minimum order value: ₹100\n"
     "• Valid for NEW BigBasket accounts only\n"
     "• Coupons may show INVALID for old users\n"
-    "• One coupon per order\n"
-    "• Non-transferable & non-refundable"
 )
 
 # ================= DATABASE =================
@@ -57,6 +59,17 @@ CREATE TABLE IF NOT EXISTS coupon_history (
 
 db.commit()
 
+# ================= HELPERS =================
+def reset_mode(context):
+    context.user_data.clear()
+
+async def is_subscribed(bot, uid):
+    try:
+        m = await bot.get_chat_member(CHANNEL_ID, uid)
+        return m.status in ("member", "administrator", "creator")
+    except:
+        return False
+
 # ================= KEYBOARDS =================
 def join_keyboard():
     return InlineKeyboardMarkup([
@@ -72,42 +85,28 @@ def main_menu():
         [InlineKeyboardButton("🎁 My Coupons", callback_data="coupons")]
     ])
 
-# ================= HELPERS =================
-async def is_subscribed(bot, user_id):
-    try:
-        member = await bot.get_chat_member(CHANNEL_ID, user_id)
-        return member.status in ("member", "administrator", "creator")
-    except:
-        return False
-
-def reset_mode(context):
-    context.user_data.clear()
-
 # ================= START =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     args = context.args
     ref = int(args[0]) if args and args[0].isdigit() else None
 
-    if not await is_subscribed(context.bot, user.id):
-        await update.message.reply_text(
-            "❌ You must join our channel to use this bot.\n\n"
-            "After joining, click **I’ve Joined / Refresh**.",
-            reply_markup=join_keyboard(),
-            parse_mode="Markdown"
-        )
-        return
+    # ✅ ALWAYS REGISTER USER (IMPORTANT FIX)
+    cur.execute("SELECT user_id, referred_by FROM users WHERE user_id=?", (user.id,))
+    row = cur.fetchone()
 
-    cur.execute("SELECT user_id FROM users WHERE user_id=?", (user.id,))
-    exists = cur.fetchone()
-
-    if not exists:
+    if not row:
         cur.execute(
             "INSERT INTO users VALUES (?,?,?,?,?,?)",
             (user.id, user.username, datetime.datetime.now(), None, 0, 0)
         )
+        db.commit()
 
-        if ref and ref != user.id:
+    # ✅ HANDLE REFERRAL ONLY ON FIRST START
+    if ref and ref != user.id:
+        cur.execute("SELECT referred_by FROM users WHERE user_id=?", (user.id,))
+        already = cur.fetchone()[0]
+        if already is None:
             cur.execute("SELECT user_id FROM users WHERE user_id=?", (ref,))
             if cur.fetchone():
                 cur.execute(
@@ -118,8 +117,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "UPDATE users SET referred_by=? WHERE user_id=?",
                     (ref, user.id)
                 )
+                db.commit()
 
-        db.commit()
+    # 🔒 SUBSCRIPTION CHECK FOR FEATURES ONLY
+    if not await is_subscribed(context.bot, user.id):
+        await update.message.reply_text(
+            "❌ You must join our channel to use this bot.\n\n"
+            "After joining, click **I’ve Joined / Refresh**.",
+            reply_markup=join_keyboard(),
+            parse_mode="Markdown"
+        )
+        return
 
     reset_mode(context)
     await update.message.reply_text(
@@ -136,22 +144,13 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if q.data == "refresh":
         if await is_subscribed(context.bot, uid):
-            await q.message.reply_text(
-                "✅ Subscription verified!",
-                reply_markup=main_menu()
-            )
+            await q.message.reply_text("✅ Subscription verified!", reply_markup=main_menu())
         else:
-            await q.message.reply_text(
-                "❌ Still not subscribed.",
-                reply_markup=join_keyboard()
-            )
+            await q.message.reply_text("❌ Still not subscribed.", reply_markup=join_keyboard())
         return
 
     if not await is_subscribed(context.bot, uid):
-        await q.message.reply_text(
-            "❌ You must join our channel to continue.",
-            reply_markup=join_keyboard()
-        )
+        await q.message.reply_text("❌ Join channel to continue.", reply_markup=join_keyboard())
         return
 
     if q.data == "stats":
@@ -178,10 +177,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif q.data == "coupons":
         reset_mode(context)
-        cur.execute(
-            "SELECT code, redeemed_at FROM coupon_history WHERE user_id=?",
-            (uid,)
-        )
+        cur.execute("SELECT code, redeemed_at FROM coupon_history WHERE user_id=?", (uid,))
         rows = cur.fetchall()
         if not rows:
             await q.message.reply_text("❌ No coupons redeemed yet.")
@@ -197,8 +193,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = update.effective_user.id
-    mode = context.user_data.get("mode")
     text = update.message.text.strip()
+    mode = context.user_data.get("mode")
 
     # ---------- REDEEM ----------
     if mode == "redeem":
@@ -212,16 +208,15 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         balance = cur.fetchone()[0]
 
         if pts <= 0 or pts > balance:
-            await update.message.reply_text("❌ Invalid points amount.")
+            await update.message.reply_text("❌ Invalid points.")
             return
 
         coupons_needed = 12 if pts == 10 else 6 if pts == 5 else pts
-
         cur.execute("SELECT code FROM coupons WHERE used=0 LIMIT ?", (coupons_needed,))
         codes = cur.fetchall()
 
         if len(codes) < coupons_needed:
-            await update.message.reply_text("❌ Coupons are currently out of stock.")
+            await update.message.reply_text("❌ Coupons out of stock.")
             reset_mode(context)
             return
 
@@ -246,46 +241,27 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode="Markdown")
         reset_mode(context)
 
-    # ---------- ADD COUPONS (TEXT MODE) ----------
-    elif mode == "add_coupons" and uid == ADMIN_ID:
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-        added = 0
-        for code in lines:
-            try:
-                cur.execute("INSERT INTO coupons(code) VALUES (?)", (code,))
-                added += 1
-            except:
-                pass
-        db.commit()
-        await update.message.reply_text(f"✅ Added {added} coupons.")
-        reset_mode(context)
-
-# ================= ADMIN COMMANDS =================
-async def add_coupons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ================= ADMIN =================
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
-    reset_mode(context)
-    context.user_data["mode"] = "add_coupons"
+    cur.execute("SELECT COUNT(*) FROM users")
+    users = cur.fetchone()[0]
 
-    if update.message.document:
-        file = await update.message.document.get_file()
-        content = (await file.download_as_bytearray()).decode()
-        lines = [l.strip() for l in content.splitlines() if l.strip()]
-        added = 0
-        for code in lines:
-            try:
-                cur.execute("INSERT INTO coupons(code) VALUES (?)", (code,))
-                added += 1
-            except:
-                pass
-        db.commit()
-        reset_mode(context)
-        await update.message.reply_text(f"✅ Added {added} coupons.")
-    else:
-        await update.message.reply_text(
-            "Send coupon codes as text (one per line)\nOR upload a TXT file."
-        )
+    cur.execute("SELECT COUNT(*) FROM coupons WHERE used=0")
+    available = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM coupons WHERE used=1")
+    used = cur.fetchone()[0]
+
+    await update.message.reply_text(
+        f"📊 *Admin Stats*\n\n"
+        f"👥 Users: {users}\n"
+        f"🎟 Available Coupons: {available}\n"
+        f"✅ Used Coupons: {used}",
+        parse_mode="Markdown"
+    )
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -302,7 +278,7 @@ async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.execute("SELECT user_id FROM users")
     users = cur.fetchall()
 
-    sent, failed = 0, 0
+    sent = failed = 0
     for (uid,) in users:
         try:
             await update.message.copy(chat_id=uid)
@@ -310,16 +286,17 @@ async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             failed += 1
 
+    report = f"📣 Broadcast Done\nSent: {sent}\nFailed: {failed}"
+    await update.message.reply_text(report)
+    await context.bot.send_message(BROADCAST_LOG_CHANNEL, report)
+
     reset_mode(context)
-    await update.message.reply_text(
-        f"📣 Broadcast completed\n\n✅ Sent: {sent}\n❌ Failed: {failed}"
-    )
 
 # ================= MAIN =================
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("addcoupons", add_coupons))
+app.add_handler(CommandHandler("stats", admin_stats))
 app.add_handler(CommandHandler("broadcast", broadcast))
 app.add_handler(CallbackQueryHandler(callbacks))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
